@@ -7,8 +7,11 @@ from time import time
 print("Running db_bot.py!")
 
 fdir = os.path.dirname(__file__)
+
+
 def getPath(fname):
     return os.path.join(fdir, fname)
+
 
 # SQLITE
 sqliteDbPath = getPath("aidb.sqlite")
@@ -24,10 +27,7 @@ sqliteCon = sqlite3.connect(sqliteDbPath)
 sqliteCursor = sqliteCon.cursor()
 
 # Read in setup files
-with (
-    open(setupSqlPath) as setupSqlFile,
-    open(setupSqlDataPath) as setupSqlDataFile
-):
+with open(setupSqlPath) as setupSqlFile, open(setupSqlDataPath) as setupSqlDataFile:
     setupSqlScript = setupSqlFile.read()
     setupSqlDataScript = setupSqlDataFile.read()
 
@@ -35,9 +35,11 @@ with (
 sqliteCursor.executescript(setupSqlScript)
 sqliteCursor.executescript(setupSqlDataScript)
 
+
 def runSql(query):
     result = sqliteCursor.execute(query).fetchall()
     return result
+
 
 # OPENAI
 configPath = getPath("config.json")
@@ -47,6 +49,7 @@ with open(configPath) as configFile:
 openAiClient = OpenAI(api_key=config["openaiKey"])
 openAiClient.models.list()  # Validates the key
 chosen_model = "gpt-4o"
+
 
 def getChatGptResponse(content):
     stream = openAiClient.chat.completions.create(
@@ -69,7 +72,7 @@ def sanitizeForJustSql(value):
         value = value.split(gptStartSqlMarker, 1)[1]
         newline_index = value.find("\n")
         if newline_index != -1:
-            value = value[newline_index + 1:]
+            value = value[newline_index + 1 :]
     if gptEndSqlMarker in value:
         value = value.split(gptEndSqlMarker, 1)[0]
     return value.strip()
@@ -103,72 +106,118 @@ strategies = {
 }
 
 questions = [
-    "Which applicants passed all of their interviews?",
-    "What companies are currently hiring and what positions do they have open?",
+    # Straightforward
     "Who received a job offer and did they accept it?",
-    "Which job listings have mandatory requirements?",
-    "What is the average salary of accepted offers by company?",
+    "What companies are currently hiring and how many active job listings does each have?",
+
+    # Multi-join complexity
+    "Which applicants passed all of their interviews but never received an offer?",
+    "Which people have applied to more than one company, and what was the outcome of each application?",
+    "For each active job listing, how many applications are in each status (pending, interviewing, rejected, offered)?",
+
+    # Aggregation and ranking
+    "What is the total compensation (salary + starting bonus + easy bonus) for each offer, ranked highest to lowest, and who accepted it?",
+    "Which companies have a higher rejection rate than acceptance rate among their applications?",
+
+    # Tricky edge cases (expect trouble)
+    "Which applicants have never failed a single interview round?",  # tricky: must exclude people with no interviews at all, or not?
+    "Which job listings have received zero applications?",           # NOT EXISTS / NOT IN
+    "Who applied to a job listing whose mandatory requirements they do not meet?",  # no skills table — may hallucinate
 ]
 
 
-for strategy in strategies:
-    responses = {"strategy": strategy, "prompt_prefix": strategies[strategy]}
-    questionResults = []
-    print("########################################################################")
-    print(f"Running strategy: {strategy}")
+def askQuestion(question, strategy="zero_shot"):
+    error = "None"
+    sqlSyntaxResponse = ""
+    queryRawResponse = ""
+    friendlyResponse = ""
+    try:
+        sqlSyntaxResponse = getChatGptResponse(strategies[strategy] + " " + question)
+        sqlSyntaxResponse = sanitizeForJustSql(sqlSyntaxResponse)
+        print("SQL:")
+        print(sqlSyntaxResponse)
 
-    for question in questions:
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print("Question:")
-        print(question)
-        error = "None"
-        sqlSyntaxResponse = ""
-        queryRawResponse = ""
-        friendlyResponse = ""
+        queryRawResponse = str(runSql(sqlSyntaxResponse))
+        print("Raw result:")
+        print(queryRawResponse)
 
-        try:
-            getSqlPrompt = strategies[strategy] + " " + question
-            sqlSyntaxResponse = getChatGptResponse(getSqlPrompt)
-            sqlSyntaxResponse = sanitizeForJustSql(sqlSyntaxResponse)
-            print("SQL Syntax Response:")
-            print(sqlSyntaxResponse)
+        friendlyResultsPrompt = (
+            "I have a job application database with the following schema:\n"
+            + setupSqlScript
+            + '\n\nI asked the question: "'
+            + question
+            + '"'
+            + '\nThe raw database result was: "'
+            + queryRawResponse
+            + '"'
+            + "\nPlease give a concise, friendly answer to the question using this data. "
+            "Do not include extra suggestions or chatter."
+        )
+        friendlyResponse = getChatGptResponse(friendlyResultsPrompt)
+        print("Answer:")
+        print(friendlyResponse)
+    except Exception as err:
+        error = str(err)
+        print(f"Error: {err}")
+    return {
+        "question": question,
+        "sql": sqlSyntaxResponse,
+        "queryRawResponse": queryRawResponse,
+        "friendlyResponse": friendlyResponse,
+        "error": error,
+    }
 
-            queryRawResponse = str(runSql(sqlSyntaxResponse))
-            print("Query Raw Response:")
-            print(queryRawResponse)
 
-            # Improved friendly response: give ChatGPT the schema context so it can
-            # interpret column values and enums correctly (fixes the class TODO).
-            friendlyResultsPrompt = (
-                "I have a job application database with the following schema:\n"
-                + setupSqlScript
-                + "\n\nI asked the question: \"" + question + "\""
-                + "\nThe raw database result was: \"" + queryRawResponse + "\""
-                + "\nPlease give a concise, friendly answer to the question using this data. "
-                "Do not include extra suggestions or chatter."
+print("\nHow would you like to run the bot?")
+print("  1) Run pre-planned questions across all strategies (saves JSON results)")
+print("  2) Ask your own questions interactively")
+mode = input("Enter 1 or 2: ").strip()
+
+if mode == "1":
+    for strategy in strategies:
+        responses = {"strategy": strategy, "prompt_prefix": strategies[strategy]}
+        questionResults = []
+        print(
+            "########################################################################"
+        )
+        print(f"Running strategy: {strategy}")
+
+        for question in questions:
+            print(
+                "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
             )
-            friendlyResponse = getChatGptResponse(friendlyResultsPrompt)
-            print("Friendly Response:")
-            print(friendlyResponse)
+            print("Question:")
+            print(question)
+            result = askQuestion(question, strategy)
+            questionResults.append(result)
 
-        except Exception as err:
-            error = str(err)
-            print(err)
+        responses["questionResults"] = questionResults
+        with open(getPath(f"response_{strategy}_{time()}.json"), "w") as outFile:
+            json.dump(responses, outFile, indent=2)
 
-        questionResults.append({
-            "question": question,
-            "sql": sqlSyntaxResponse,
-            "queryRawResponse": queryRawResponse,
-            "friendlyResponse": friendlyResponse,
-            "error": error,
-        })
+elif mode == "2":
+    print("\nAvailable strategies:")
+    for i, name in enumerate(strategies, 1):
+        print(f"  {i}) {name}")
+    strategyChoice = input("Choose a strategy (1/2/3, default 1): ").strip()
+    strategyNames = list(strategies.keys())
+    try:
+        chosenStrategy = strategyNames[int(strategyChoice) - 1]
+    except (ValueError, IndexError):
+        chosenStrategy = strategyNames[0]
+    print(f"Using strategy: {chosenStrategy}")
+    print("Type your questions below. Press Enter on an empty line to quit.\n")
 
-    responses["questionResults"] = questionResults
+    while True:
+        question = input("Your question: ").strip()
+        if not question:
+            break
+        askQuestion(question, chosenStrategy)
+        print()
 
-    with open(getPath(f"response_{strategy}_{time()}.json"), "w") as outFile:
-        json.dump(responses, outFile, indent=2)
-
+else:
+    print("Invalid choice. Exiting.")
 
 sqliteCursor.close()
 sqliteCon.close()
-print("Done!")
+print("Exiting!")
